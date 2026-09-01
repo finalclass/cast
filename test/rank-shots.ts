@@ -1,0 +1,317 @@
+#!/usr/bin/env -S deno run --allow-read --allow-write --allow-net --allow-env
+/**
+ * Phase 2: score compiling pours against the spec on [0, 1].
+ * Same spec+mli body as the pour. No seed. Does not regenerate code.
+ */
+
+import { basename, dirname, fromFileUrl, join } from "jsr:@std/path@1";
+import { buildPrompt, loadEnv, retryAfterSeconds } from "./heat.ts";
+import { mapPool } from "./pool.ts";
+
+const HERE = dirname(fromFileUrl(import.meta.url));
+
+function take(args: string[], i: number, flag: string): [string, number] {
+  const a = args[i];
+  if (a === flag) {
+    const v = args[i + 1];
+    if (!v || v.startsWith("--")) {
+      console.error(`${flag} needs a value`);
+      Deno.exit(1);
+    }
+    return [v, i + 1];
+  }
+  if (a.startsWith(flag + "=")) return [a.slice(flag.length + 1), i];
+  throw new Error("not this flag");
+}
+
+function parseScore(text: string): { score: number | null; reason?: string } {
+  const scoreLine = text.match(/^\s*SCORE\s*[:=]?\s*([01](?:\.\d+)?|\.\d+)\s*$/im);
+  const reasonLine = text.match(/^\s*REASON\s*[:=]?\s*(.+)$/im);
+  if (scoreLine) {
+    const n = Number(scoreLine[1]);
+    if (Number.isFinite(n) && n >= 0 && n <= 1) {
+      return { score: n, reason: reasonLine?.[1]?.trim() };
+    }
+  }
+  const json = text.match(/"score"\s*:\s*([01](?:\.\d+)?)/);
+  if (json) {
+    const n = Number(json[1]);
+    if (Number.isFinite(n) && n >= 0 && n <= 1) {
+      return { score: n, reason: reasonLine?.[1]?.trim() };
+    }
+  }
+  return { score: null };
+}
+
+type RankRow = {
+  ml: string;
+  ok: boolean;
+  score: number | null;
+  reason?: string;
+  error?: string;
+  raw?: string;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  cost?: number;
+  elapsed_ms: number;
+};
+
+async function rankOne(
+  env: Record<string, string>,
+  opts: {
+    model: string;
+    temperature: number;
+    provider?: string;
+    maxTokens: number;
+  },
+  system: string,
+  user: string,
+): Promise<Omit<RankRow, "ml">> {
+  const started = Date.now();
+  const key = env.OPENROUTER_API_KEY;
+  if (!key) {
+    return { ok: false, score: null, error: "OPENROUTER_API_KEY missing", elapsed_ms: Date.now() - started };
+  }
+
+  const body: Record<string, unknown> = {
+    model: opts.model,
+    temperature: opts.temperature,
+    max_tokens: opts.maxTokens,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+  };
+  if (opts.provider) {
+    body.provider = { order: [opts.provider], allow_fallbacks: false };
+  }
+
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer " + key,
+      "Content-Type": "application/json",
+      "HTTP-Referer": "https://github.com/finalclass/cast",
+      "X-OpenRouter-Title": "cast-rank-test",
+    },
+    body: JSON.stringify(body),
+  });
+  const raw = await res.text();
+  let json: Record<string, unknown>;
+  try {
+    json = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return {
+      ok: false,
+      score: null,
+      error: `http ${res.status} non-json: ${raw.slice(0, 400)}`,
+      elapsed_ms: Date.now() - started,
+    };
+  }
+  if (!res.ok) {
+    const err = json.error as { message?: string; metadata?: unknown } | undefined;
+    const extra = err?.metadata ? " " + JSON.stringify(err.metadata) : "";
+    return {
+      ok: false,
+      score: null,
+      error: `http ${res.status}: ${err?.message ?? raw.slice(0, 800)}${extra}`,
+      elapsed_ms: Date.now() - started,
+    };
+  }
+  const choices = json.choices as Array<{
+    message?: { content?: string | null };
+    error?: { message?: string };
+  }>;
+  const content = choices?.[0]?.message?.content ?? "";
+  if (choices?.[0]?.error?.message) {
+    return {
+      ok: false,
+      score: null,
+      error: choices[0].error.message,
+      elapsed_ms: Date.now() - started,
+    };
+  }
+  if (!content) {
+    return { ok: false, score: null, error: "empty content", elapsed_ms: Date.now() - started };
+  }
+  const parsed = parseScore(content);
+  const usage = (json.usage ?? {}) as {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    cost?: number;
+  };
+  return {
+    ok: parsed.score !== null,
+    score: parsed.score,
+    reason: parsed.reason,
+    raw: content.slice(0, 800),
+    prompt_tokens: usage.prompt_tokens,
+    completion_tokens: usage.completion_tokens,
+    cost: usage.cost,
+    error: parsed.score === null ? "unparseable score: " + content.slice(0, 200) : undefined,
+    elapsed_ms: Date.now() - started,
+  };
+}
+
+async function rankWithRetry(
+  env: Record<string, string>,
+  opts: {
+    model: string;
+    temperature: number;
+    provider?: string;
+    maxTokens: number;
+  },
+  system: string,
+  user: string,
+): Promise<Omit<RankRow, "ml">> {
+  let last: Omit<RankRow, "ml"> | undefined;
+  for (let t = 0; t < 8; t++) {
+    last = await rankOne(env, opts, system, user);
+    if (last.ok || !last.error) return last;
+    const wait = retryAfterSeconds(last.error);
+    if (wait === null) return last;
+    console.log(`rate-limit, sleep ${wait}s (try ${t + 1}/8)`);
+    await new Promise((r) => setTimeout(r, wait * 1000));
+  }
+  return last!;
+}
+
+async function main() {
+  let dir = join(HERE, "runs");
+  let specPath = join(HERE, "spec/confirm-hold-closed.md");
+  let mliPath = join(HERE, "confirm-hold.mli");
+  let model = "openai/gpt-oss-120b";
+  let temperature = 0.7;
+  let provider = "cerebras";
+  let concurrency = 20;
+  let maxTokens = 256;
+  const positional: string[] = [];
+  const args = Deno.args;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--spec" || a.startsWith("--spec=")) {
+      const [v, ni] = take(args, i, "--spec");
+      specPath = v;
+      i = ni;
+    } else if (a === "--mli" || a.startsWith("--mli=")) {
+      const [v, ni] = take(args, i, "--mli");
+      mliPath = v;
+      i = ni;
+    } else if (a === "--model" || a.startsWith("--model=")) {
+      const [v, ni] = take(args, i, "--model");
+      model = v;
+      i = ni;
+    } else if (a === "--temperature" || a.startsWith("--temperature=")) {
+      const [v, ni] = take(args, i, "--temperature");
+      temperature = Number(v);
+      i = ni;
+    } else if (a === "--provider" || a.startsWith("--provider=")) {
+      const [v, ni] = take(args, i, "--provider");
+      provider = v;
+      i = ni;
+    } else if (a === "--concurrency" || a.startsWith("--concurrency=")) {
+      const [v, ni] = take(args, i, "--concurrency");
+      concurrency = Number(v);
+      i = ni;
+    } else if (a === "--max-tokens" || a.startsWith("--max-tokens=")) {
+      const [v, ni] = take(args, i, "--max-tokens");
+      maxTokens = Number(v);
+      i = ni;
+    } else if (a.startsWith("-")) {
+      console.error("unknown flag", a);
+      Deno.exit(2);
+    } else {
+      positional.push(a);
+    }
+  }
+  if (positional[0]) dir = positional[0];
+
+  const okListPath = join(dir, "compile-ok.txt");
+  let mls: string[] = [];
+  try {
+    mls = (await Deno.readTextFile(okListPath))
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  } catch {
+    console.error("missing", okListPath, "— run compile-shots.ts first");
+    Deno.exit(1);
+  }
+  if (mls.length === 0) {
+    console.error("compile-ok.txt empty");
+    Deno.exit(1);
+  }
+
+  const env = await loadEnv();
+  const spec = await Deno.readTextFile(specPath);
+  const mli = await Deno.readTextFile(mliPath);
+  const pour = buildPrompt(spec, mli);
+  const system =
+    "You score one OCaml implementation against the given specification. " +
+    "Do not generate or rewrite code. Output exactly two lines.";
+
+  console.log(
+    `rank model=${model} temperature=${temperature} seed=none provider=${provider} n=${mls.length} concurrency=${concurrency}`,
+  );
+
+  const wall0 = Date.now();
+  const rows = await mapPool(mls, concurrency, async (ml) => {
+    const code = await Deno.readTextFile(ml);
+    const user = pour.user +
+      "\n\n## Candidate implementation\n\n```ocaml\n" +
+      code.trim() +
+      "\n```\n\n" +
+      "Score this candidate against the specification on a closed scale 0.0–1.0. " +
+      "1.0 means every spec rule is honoured. 0.0 means the code is unrelated. " +
+      "Reply with exactly two lines and nothing else:\n" +
+      "SCORE <float>\n" +
+      "REASON <one sentence>\n";
+    const r = await rankWithRetry(env, { model, temperature, provider, maxTokens }, system, user);
+    const row: RankRow = { ml, ...r };
+    console.log(
+      `${row.ok ? "ok" : "FAIL"} ${basename(ml)} score=${row.score ?? "-"} ${row.elapsed_ms}ms` +
+        (row.reason ? ` ${row.reason}` : "") +
+        (row.error && !row.ok ? ` ${row.error}` : ""),
+    );
+    return row;
+  });
+  const wall_ms = Date.now() - wall0;
+
+  const scored = rows.filter((r) => r.score !== null) as Array<RankRow & { score: number }>;
+  scored.sort((a, b) => b.score - a.score || a.ml.localeCompare(b.ml));
+  const winner = scored[0] ?? null;
+  const scores = scored.map((r) => r.score);
+  const mean = scores.length ? scores.reduce((s, n) => s + n, 0) / scores.length : null;
+
+  const summary = {
+    wall_ms,
+    concurrency,
+    model,
+    temperature,
+    seed: null,
+    n: rows.length,
+    scored: scored.length,
+    mean_score: mean,
+    max_score: winner?.score ?? null,
+    winner: winner
+      ? { ml: winner.ml, score: winner.score, reason: winner.reason }
+      : null,
+    ranking: scored.map((r) => ({
+      ml: r.ml,
+      score: r.score,
+      reason: r.reason,
+      elapsed_ms: r.elapsed_ms,
+    })),
+    failures: rows.filter((r) => r.score === null),
+  };
+  const out = join(dir, "ranking.json");
+  await Deno.writeTextFile(out, JSON.stringify(summary, null, 2) + "\n");
+  console.log(`\nscored ${scored.length}/${rows.length} wall_ms=${wall_ms} mean=${mean?.toFixed(3) ?? "-"}`);
+  if (winner) {
+    console.log(`winner score=${winner.score} ${winner.ml}`);
+    if (winner.reason) console.log(`reason ${winner.reason}`);
+  }
+  console.log(`ranking ${out}`);
+}
+
+await main();

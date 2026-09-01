@@ -12,6 +12,7 @@
  */
 
 import { dirname, fromFileUrl, join } from "jsr:@std/path@1";
+import { mapPool } from "./pool.ts";
 
 const HERE = dirname(fromFileUrl(import.meta.url));
 const ROOT = join(HERE, "..");
@@ -30,6 +31,7 @@ type Opts = {
   maxTokens: number;
   dryRun: boolean;
   requireParameters: boolean;
+  concurrency: number;
 };
 
 function parseSimpleEnv(text: string): Record<string, string> {
@@ -53,7 +55,7 @@ function parseSimpleEnv(text: string): Record<string, string> {
   return env;
 }
 
-async function loadEnv(): Promise<Record<string, string>> {
+export async function loadEnv(): Promise<Record<string, string>> {
   const merged: Record<string, string> = { ...Deno.env.toObject() };
   const candidates = [
     join(ROOT, ".env.local"),
@@ -85,6 +87,7 @@ flags:
   --mli=PATH          default test/confirm-hold.mli
   --out-dir=PATH      default test/runs
   --max-tokens=N      default 8000
+  --concurrency=N     parallel shots (default 1)
   --dry-run           print prompt stats, no HTTP
   --no-require-params do not set provider.require_parameters
 `);
@@ -132,6 +135,7 @@ function parseArgs(args: string[]): Opts {
   let requireParameters = true;
   let seedFrom: number | undefined;
   let seedTo: number | undefined;
+  let concurrency = 1;
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -191,6 +195,10 @@ function parseArgs(args: string[]): Opts {
       const [v, ni] = take(args, i, "--seed-to");
       seedTo = Number(v);
       i = ni;
+    } else if (a === "--concurrency" || a.startsWith("--concurrency=")) {
+      const [v, ni] = take(args, i, "--concurrency");
+      concurrency = Number(v);
+      i = ni;
     } else {
       console.error("unknown flag", a);
       usage();
@@ -220,6 +228,10 @@ function parseArgs(args: string[]): Opts {
       Deno.exit(1);
     }
   }
+  if (!Number.isInteger(concurrency) || concurrency < 1) {
+    console.error("concurrency must be integer >= 1");
+    Deno.exit(1);
+  }
 
   return {
     heat: { model, temperature, seed },
@@ -233,6 +245,7 @@ function parseArgs(args: string[]): Opts {
     maxTokens,
     dryRun,
     requireParameters,
+    concurrency,
   };
 }
 
@@ -255,7 +268,7 @@ async function sha256(text: string): Promise<string> {
   return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function buildPrompt(spec: string, mli: string): { system: string; user: string } {
+export function buildPrompt(spec: string, mli: string): { system: string; user: string } {
   const system =
     "You generate OCaml. Output only the contents of a single .ml file. " +
     "No markdown fences, no commentary before or after. " +
@@ -436,7 +449,7 @@ async function shot(
   return meta;
 }
 
-function retryAfterSeconds(err: string): number | null {
+export function retryAfterSeconds(err: string): number | null {
   const m = err.match(/retry_after_seconds["']?\s*[:=]\s*(\d+)/);
   if (m) return Number(m[1]);
   if (err.includes("429") || err.includes("rate-limited")) return 60;
@@ -477,37 +490,49 @@ async function main() {
   const seeds: number[] = opts.seedFrom !== undefined && opts.seedTo !== undefined
     ? Array.from({ length: opts.seedTo - opts.seedFrom + 1 }, (_, i) => opts.seedFrom! + i)
     : [opts.heat.seed];
-  const total = seeds.length * (seeds.length > 1 ? 1 : opts.repeat);
-  console.log(`prompt chars≈${system.length + user.length} repeat=${opts.repeat} seeds=${seeds.length}`);
+  const times = seeds.length > 1 ? 1 : opts.repeat;
+  type Job = { seed: number; attempt: number };
+  const jobs: Job[] = [];
+  for (const seed of seeds) {
+    for (let i = 1; i <= times; i++) jobs.push({ seed, attempt: i });
+  }
+  const total = jobs.length;
+  console.log(
+    `prompt chars≈${system.length + user.length} repeat=${opts.repeat} seeds=${seeds.length} concurrency=${opts.concurrency}`,
+  );
 
   if (opts.dryRun) {
     console.log("dry-run: no HTTP");
     return;
   }
 
-  const results: ShotMeta[] = [];
-  let n = 0;
-  for (const seed of seeds) {
-    const heatOpts = { ...opts, heat: { ...opts.heat, seed } };
-    const times = seeds.length > 1 ? 1 : opts.repeat;
-    for (let i = 1; i <= times; i++) {
-      n += 1;
-      console.log(`\nshot ${n}/${total} seed=${seed}`);
-      const r = await shotWithRetry(heatOpts, env, system, user, i);
-      results.push(r);
-      if (!r.ok) console.log(`FAIL ${r.error}`);
-      else {
-        console.log(`ok sha256=${r.sha256} lines=${r.lines} tokens=${r.prompt_tokens}+${r.completion_tokens} ${r.elapsed_ms}ms`);
-        if (r.out_file) console.log(`  ${r.out_file}`);
-      }
+  const wall0 = Date.now();
+  const results = await mapPool(jobs, opts.concurrency, async (job, idx) => {
+    const heatOpts = { ...opts, heat: { ...opts.heat, seed: job.seed } };
+    console.log(`shot ${idx + 1}/${total} seed=${job.seed} start`);
+    const r = await shotWithRetry(heatOpts, env, system, user, job.attempt);
+    if (!r.ok) console.log(`FAIL seed=${job.seed} ${r.error}`);
+    else {
+      console.log(
+        `ok seed=${job.seed} sha256=${r.sha256} lines=${r.lines} tokens=${r.prompt_tokens}+${r.completion_tokens} ${r.elapsed_ms}ms`,
+      );
     }
-  }
+    return r;
+  });
+  const wall_ms = Date.now() - wall0;
 
   const hashes = results.filter((r) => r.ok && r.sha256).map((r) => r.sha256!);
   const unique = new Set(hashes);
+  const mean_ms = hashes.length
+    ? Math.round(results.filter((r) => r.ok).reduce((s, r) => s + r.elapsed_ms, 0) / hashes.length)
+    : 0;
   console.log(`\nok=${hashes.length}/${results.length} unique_hashes=${unique.size}`);
+  console.log(`wall_ms=${wall_ms} mean_shot_ms=${mean_ms} concurrency=${opts.concurrency}`);
   const summary = join(opts.outDir, `summary-${Date.now()}.json`);
-  await Deno.writeTextFile(summary, JSON.stringify({ results }, null, 2) + "\n");
+  await Deno.writeTextFile(
+    summary,
+    JSON.stringify({ wall_ms, mean_ms, concurrency: opts.concurrency, results }, null, 2) + "\n",
+  );
   console.log(`summary ${summary}`);
 }
 
