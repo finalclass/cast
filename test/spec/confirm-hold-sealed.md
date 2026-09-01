@@ -29,7 +29,7 @@ Return the first error. Do not reorder. Do not insert extra checks between these
 4. hold_id not in the table → Hold_not_found.
 5. snapshot expires_at fails ISO → Malformed.
 6. status Cancelled → Hold_cancelled.
-7. status Confirmed → Hold_already_confirmed with booking_id BKG- ^ hold_id.
+7. status Confirmed → Hold_already_confirmed with booking_id BK- ^ hold_id.
 8. confirmed_at > expires_at lexicographic (OCaml string `>`) → Hold_expired (hold_id, expires_at).
 9. guest_blocked → Guest_blocked guest_id.
 10. property_closed → Property_closed (property_id, confirmed_at).
@@ -38,7 +38,7 @@ Return the first error. Do not reorder. Do not insert extra checks between these
 13. version >= 1000 → Concurrent_confirm hold_id.
 14. inventory = 0 → Inventory_lost (room_type_id, confirmed_at).
 15. unit_cents * nights + tax_cents ≠ price_cents → Price_drift (recomputed, price_cents).
-16. Ok: booking_id BKG- ^ hold_id; total_cents = unit_cents * nights + tax_cents;
+16. Ok: booking_id BK- ^ hold_id; total_cents = unit_cents * nights + tax_cents;
     lines = one line from snapshot room_type_id, nights, unit_cents, tax_cents;
     confirmed_at = cmd.confirmed_at (already trimmed); copy property_id guest_id currency hold_id.
 
@@ -268,9 +268,9 @@ recomputed: 21000
 
 ## Use cases (expected prefix of the result)
 Common cmd: payment_ref pay_ok, confirmed_at 2026-11-01T10:00:00Z, actor desk-1 unless stated.
-happy H-OPEN-OK → Ok BKG-H-OPEN-OK total 21000
+happy H-OPEN-OK → Ok BK-H-OPEN-OK total 21000
 expired H-EXPIRED → Hold_expired, second payload expires_at 2026-01-01T00:00:00Z
-already H-CONFIRMED → Hold_already_confirmed BKG-H-CONFIRMED
+already H-CONFIRMED → Hold_already_confirmed BK-H-CONFIRMED
 cancel H-CANCEL → Hold_cancelled
 mismatch H-PAY-MISS pay_ok → Payment_mismatch pay_ok vs pay_stored
 uncaptured H-PAY-OPEN → Payment_not_captured
