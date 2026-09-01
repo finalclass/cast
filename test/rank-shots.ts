@@ -24,21 +24,39 @@ function take(args: string[], i: number, flag: string): [string, number] {
   throw new Error("not this flag");
 }
 
-function parseScore(text: string): { score: number | null; reason?: string } {
-  const scoreLine = text.match(/^\s*SCORE\s*[:=]?\s*([01](?:\.\d+)?|\.\d+)\s*$/im);
-  const reasonLine = text.match(/^\s*REASON\s*[:=]?\s*(.+)$/im);
-  if (scoreLine) {
-    const n = Number(scoreLine[1]);
-    if (Number.isFinite(n) && n >= 0 && n <= 1) {
-      return { score: n, reason: reasonLine?.[1]?.trim() };
+function messageText(
+  msg:
+    | {
+      content?: string | null | Array<{ type?: string; text?: string }>;
+      reasoning?: string | null;
+      reasoning_content?: string | null;
     }
+    | undefined,
+): string {
+  if (!msg) return "";
+  const fromContent = typeof msg.content === "string"
+    ? msg.content
+    : Array.isArray(msg.content)
+    ? msg.content.map((p) => (typeof p === "string" ? p : p?.text ?? "")).join("")
+    : "";
+  return [fromContent, msg.reasoning, msg.reasoning_content]
+    .filter((s): s is string => typeof s === "string" && s.trim().length > 0)
+    .join("\n");
+}
+
+function parseScore(text: string): { score: number | null; reason?: string } {
+  const reasons = [...text.matchAll(/^\s*REASON\s*[:=]?\s*(.+)$/gim)];
+  const reason = reasons.at(-1)?.[1]?.trim();
+  const scores = [...text.matchAll(/SCORE\s*[:=]?\s*([01](?:\.\d+)?|\.\d+)/gi)];
+  const last = scores.at(-1);
+  if (last) {
+    const n = Number(last[1]);
+    if (Number.isFinite(n) && n >= 0 && n <= 1) return { score: n, reason };
   }
-  const json = text.match(/"score"\s*:\s*([01](?:\.\d+)?)/);
+  const json = [...text.matchAll(/"score"\s*:\s*([01](?:\.\d+)?)/g)].at(-1);
   if (json) {
     const n = Number(json[1]);
-    if (Number.isFinite(n) && n >= 0 && n <= 1) {
-      return { score: n, reason: reasonLine?.[1]?.trim() };
-    }
+    if (Number.isFinite(n) && n >= 0 && n <= 1) return { score: n, reason };
   }
   return { score: null };
 }
@@ -77,6 +95,7 @@ async function rankOne(
     model: opts.model,
     temperature: opts.temperature,
     max_tokens: opts.maxTokens,
+    reasoning: { effort: "low" },
     messages: [
       { role: "system", content: system },
       { role: "user", content: user },
@@ -119,20 +138,33 @@ async function rankOne(
     };
   }
   const choices = json.choices as Array<{
-    message?: { content?: string | null };
+    finish_reason?: string;
+    native_finish_reason?: string;
+    message?: {
+      content?: string | null | Array<{ type?: string; text?: string }>;
+      reasoning?: string | null;
+      reasoning_content?: string | null;
+    };
     error?: { message?: string };
   }>;
-  const content = choices?.[0]?.message?.content ?? "";
-  if (choices?.[0]?.error?.message) {
+  const choice = choices?.[0];
+  if (choice?.error?.message) {
     return {
       ok: false,
       score: null,
-      error: choices[0].error.message,
+      error: choice.error.message,
       elapsed_ms: Date.now() - started,
     };
   }
+  const content = messageText(choice?.message);
   if (!content) {
-    return { ok: false, score: null, error: "empty content", elapsed_ms: Date.now() - started };
+    const keys = choice?.message ? Object.keys(choice.message).join(",") : "no-message";
+    return {
+      ok: false,
+      score: null,
+      error: `empty content finish=${choice?.finish_reason ?? "?"} msg_keys=${keys}`,
+      elapsed_ms: Date.now() - started,
+    };
   }
   const parsed = parseScore(content);
   const usage = (json.usage ?? {}) as {
@@ -184,7 +216,7 @@ async function main() {
   let temperature = 0.7;
   let provider = "cerebras";
   let concurrency = 20;
-  let maxTokens = 256;
+  let maxTokens = 2048;
   const positional: string[] = [];
   const args = Deno.args;
   for (let i = 0; i < args.length; i++) {
