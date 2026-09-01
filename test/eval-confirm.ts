@@ -62,6 +62,7 @@ let () =
   let n = n + check "stale" (confirm (common "H-STALE")) "Concurrent_confirm" in
   let n = n + check "missing" (confirm (common "H-NOPE")) "Hold_not_found" in
   let n = n + check "anon" (confirm (cmd "H-OPEN-OK" "pay_ok" "2026-11-01T10:00:00Z" "anonymous")) "Actor_unauthorized" in
+  let n = n + check "kiosk" (confirm (cmd "H-OPEN-OK" "pay_ok" "2026-11-01T10:00:00Z" "kiosk")) "Actor_unauthorized" in
   let n = n + check "empty-id" (confirm (cmd "" "pay_ok" "2026-11-01T10:00:00Z" "desk-1")) "Malformed" in
   let n = n + check "guest-self" (confirm (cmd "H-OPEN-OK" "pay_ok" "2026-11-01T10:00:00Z" "guest-self")) "Ok BK-H-OPEN-OK total 21000" in
   let n = n + check "bad-iso" (confirm (cmd "H-OPEN-OK" "pay_ok" "2026-11-01" "desk-1")) "Malformed" in

@@ -4,7 +4,7 @@ Implement test/confirm-hold.mli in one complete OCaml .ml. Stdlib only.
 One exported val: confirm. No HTTP, SQL, clocks, Jane Street, Lwt, Eio, Obj.
 No exceptions for business errors. Result only. No objects. No polymorphic variants.
 Time is only confirm_cmd.confirmed_at. Do not parse hold_id; it is opaque.
-Actor guest-self is allowed. Actor anonymous is Actor_unauthorized.
+Actor guest-self is allowed. Actor anonymous or kiosk is Actor_unauthorized.
 Trim hold_id, payment_ref, confirmed_at, actor with String.trim before any other check.
 After trim, empty hold_id or payment_ref or confirmed_at or actor is Malformed, never Actor_unauthorized.
 ISO-8601 here means length 20 and last char Z. No other ISO check.
@@ -25,7 +25,7 @@ Copy the .mli types at the top of the .ml. Define a private `status` and `hold` 
 Return the first error. Do not reorder. Do not insert extra checks between these steps.
 1. After trim: empty hold_id, payment_ref, confirmed_at, or actor → Malformed.
 2. confirmed_at fails ISO → Malformed.
-3. actor is exactly anonymous → Actor_unauthorized.
+3. actor is exactly anonymous or exactly kiosk → Actor_unauthorized.
 4. hold_id not in the table → Hold_not_found.
 5. snapshot expires_at fails ISO → Malformed.
 6. status Cancelled → Hold_cancelled.
@@ -281,6 +281,7 @@ closed H-CLOSED → Property_closed P-SHUT
 stale H-STALE → Concurrent_confirm
 missing H-NOPE → Hold_not_found
 anon H-OPEN-OK actor anonymous → Actor_unauthorized
+kiosk H-OPEN-OK actor kiosk → Actor_unauthorized
 empty-id hold_id empty → Malformed
 guest-self H-OPEN-OK actor guest-self → Ok (same as happy)
 bad-iso H-OPEN-OK confirmed_at 2026-11-01 → Malformed (not length 20)
