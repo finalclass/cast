@@ -3,3 +3,4 @@ _build/
 *.exe
 .env
 .env.local
+test/runs/
