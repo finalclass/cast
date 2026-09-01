@@ -51,7 +51,35 @@ A cavity is not a service. The architectural contract stays at the service (a co
 4. **Pour.** Generate every cavity in parallel, each with its own shot heat, always from scratch.
 5. **Compile the program.** Keep `_build`. Unchanged units take seconds.
 
-The wall-clock of a pour is the slowest shot, not the sum — in theory on the order of 15 seconds. Spec correction and die-heat iteration sit outside that window. One failed compile and the 15 seconds are gone; you fix the spec and pour again.
+The wall-clock of a pour is the slowest shot, not the sum. On Cerebras `gpt-oss-120b`, one hundred ConfirmHold shots at concurrency 20 finished in about 15 seconds. Spec correction and die-heat iteration sit outside that window. One failed compile and those 15 seconds are gone; you fix the spec and pour again.
+
+## Who writes what
+
+A strong model writes the spec **and** the checks that will later accept or reject a pour (worked examples, lints). A fast shot model pours the `.ml`. Those are different jobs.
+
+The checks are programs. If a sentence in the spec has no check, the pourer will skip it and nobody will notice. “Score this 1–1000” is not a check.
+
+For **one** cavity, skip the foundry: let the strong model write the body, then run the checks. Cast pays when there are many cavities and wall-clock is the slowest shot — not when you spend a frontier call on every endpoint, and not when you spend one on reviewing 69 almost-identical pours.
+
+## The sieve
+
+Gates, in order:
+
+1. Compile the body against the die.
+2. Run the spec’s examples and lints (the compiler, a test driver, grep — not chat).
+3. Optionally a **different** model reviews only the survivors. It looks for missing checks. Its output is a spec patch, never an edit of `.ml`.
+
+An LLM judge on the pourer, or a rank of every compiling shot, saturates and invents nits. Keep it off the acceptance path.
+
+This is the same idea as Axe **labels**: a named verification pipeline (`[test]`, `[contract]`, …), deterministic tools first, an agent only for what a script cannot say yes/no to. Cast does not use the Axe harness. It re-pours instead of syncing a delta.
+
+## Heat (what actually repeated)
+
+- `temperature = 0` is greedy. Seed is unused. A hundred seeds produced one hash.
+- `temperature > 0` plus seed: Cerebras `openai/gpt-oss-120b` repeated byte-for-byte. `google/gemini-3.6-flash` did not (three hashes from five identical heats), and thinking ate an 8k token cap before any body appeared.
+- Shot heat we keep: oss-120b on Cerebras. About 2 s per shot. On a closed ConfirmHold spec, 69/100 compiled. Production is the sieve plus a closed spec, not a smarter pourer.
+
+Die heat stays a stronger model. Shot heat stays cheap and, where the provider actually honours it, seed-stable.
 
 ## What you never do
 
@@ -59,10 +87,12 @@ The wall-clock of a pour is the slowest shot, not the sum — in theory on the o
 - Skip compiling dies before the pour.
 - Let the linker grain become the design grain (one-operation “services”).
 - Treat Heat as a chat setting. Heat lives in the spec.
+- Let the pourer grade its own shots.
+- Treat an LLM score as the acceptance test.
 
 ## Status
 
-Manifesto only. The pour harness is not in this tree.
+Manifesto plus a Heat probe under `test/` (one OCaml cavity through OpenRouter). Not a product harness.
 
 ## Related
 
