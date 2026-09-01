@@ -9,8 +9,10 @@ Heat = `(model, temperature, seed)`.
 | | |
 | --- | --- |
 | `confirm-hold.mli` | die |
-| `spec/confirm-hold.md` | ~5000-line stand-in context (not a real SDD) |
-| `gen-spec.ts` | regenerates the spec |
+| `spec/confirm-hold.md` | ~5000-line stand-in (open, padded) |
+| `spec/confirm-hold-closed.md` | ~1000-line closed spec (one decision order) |
+| `gen-spec.ts` | regenerates the fat spec |
+| `gen-spec-closed.ts` | regenerates the closed spec |
 | `heat.ts` | OpenRouter shot |
 
 `spec/confirm-hold.md` is bulk: architecture notes, service notes, collaborator notes, error catalog, use cases, style. A live pour would instead get arch + service + contracts + use cases + libraries + skills. Here that mass is generated prose about **ConfirmHold**.
@@ -26,6 +28,9 @@ Key: `OPENROUTER_API_KEY` in the environment or `/home/sel/fc/.env.local` (`expo
 ./test/heat.ts --dry-run --heat openai/gpt-oss-20b:0:42
 ./test/heat.ts --heat openai/gpt-oss-20b:0:42 --repeat 2
 ./test/heat.ts --provider groq --heat meta-llama/llama-3.1-8b-instant:0:1 --repeat 2
+./test/gen-spec-closed.ts
+./test/heat.ts --provider cerebras --heat openai/gpt-oss-120b:0:42 \
+  --spec test/spec/confirm-hold-closed.md --max-tokens 4000 --repeat 5
 ```
 
 `--provider groq` pins OpenRouter to Groq and disables fallbacks. With a seed, `require_parameters` is on so providers that cannot honour `seed` are skipped.
