@@ -22,6 +22,8 @@ type Opts = {
   heat: Heat;
   provider?: string;
   repeat: number;
+  seedFrom?: number;
+  seedTo?: number;
   spec: string;
   mli: string;
   outDir: string;
@@ -78,6 +80,7 @@ function usage(): never {
 flags:
   --provider=groq     pin OpenRouter provider (no fallbacks)
   --repeat=N          same heat N times (default 1)
+  --seed-from=A --seed-to=B   one shot per seed A..B inclusive (ignores --repeat)
   --spec=PATH         default test/spec/confirm-hold.md
   --mli=PATH          default test/confirm-hold.mli
   --out-dir=PATH      default test/runs
@@ -127,6 +130,8 @@ function parseArgs(args: string[]): Opts {
   let maxTokens = 8000;
   let dryRun = false;
   let requireParameters = true;
+  let seedFrom: number | undefined;
+  let seedTo: number | undefined;
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -178,6 +183,14 @@ function parseArgs(args: string[]): Opts {
       const [v, ni] = take(args, i, "--max-tokens");
       maxTokens = Number(v);
       i = ni;
+    } else if (a === "--seed-from" || a.startsWith("--seed-from=")) {
+      const [v, ni] = take(args, i, "--seed-from");
+      seedFrom = Number(v);
+      i = ni;
+    } else if (a === "--seed-to" || a.startsWith("--seed-to=")) {
+      const [v, ni] = take(args, i, "--seed-to");
+      seedTo = Number(v);
+      i = ni;
     } else {
       console.error("unknown flag", a);
       usage();
@@ -197,11 +210,23 @@ function parseArgs(args: string[]): Opts {
     console.error("repeat must be integer >= 1");
     Deno.exit(1);
   }
+  if ((seedFrom === undefined) !== (seedTo === undefined)) {
+    console.error("seed-from and seed-to must be used together");
+    Deno.exit(1);
+  }
+  if (seedFrom !== undefined && seedTo !== undefined) {
+    if (!Number.isInteger(seedFrom) || !Number.isInteger(seedTo) || seedTo < seedFrom) {
+      console.error("seed-from/to must be integers, to >= from");
+      Deno.exit(1);
+    }
+  }
 
   return {
     heat: { model, temperature, seed },
     provider,
     repeat,
+    seedFrom,
+    seedTo,
     spec,
     mli,
     outDir,
@@ -411,6 +436,32 @@ async function shot(
   return meta;
 }
 
+function retryAfterSeconds(err: string): number | null {
+  const m = err.match(/retry_after_seconds["']?\s*[:=]\s*(\d+)/);
+  if (m) return Number(m[1]);
+  if (err.includes("429") || err.includes("rate-limited")) return 60;
+  return null;
+}
+
+async function shotWithRetry(
+  opts: Opts,
+  env: Record<string, string>,
+  system: string,
+  user: string,
+  attempt: number,
+): Promise<ShotMeta> {
+  let last: ShotMeta | undefined;
+  for (let t = 0; t < 8; t++) {
+    last = await shot(opts, env, system, user, attempt);
+    if (last.ok) return last;
+    const wait = last.error ? retryAfterSeconds(last.error) : null;
+    if (wait === null) return last;
+    console.log(`rate-limit, sleep ${wait}s (try ${t + 1}/8)`);
+    await new Promise((r) => setTimeout(r, wait * 1000));
+  }
+  return last!;
+}
+
 async function main() {
   const opts = parseArgs(Deno.args);
   const env = await loadEnv();
@@ -423,7 +474,11 @@ async function main() {
   if (opts.provider) console.log(`provider=${opts.provider} (pinned, no fallbacks)`);
   console.log(`spec ${opts.spec} lines=${specLines} bytes=${spec.length}`);
   console.log(`mli  ${opts.mli}`);
-  console.log(`prompt chars≈${system.length + user.length} repeat=${opts.repeat}`);
+  const seeds: number[] = opts.seedFrom !== undefined && opts.seedTo !== undefined
+    ? Array.from({ length: opts.seedTo - opts.seedFrom + 1 }, (_, i) => opts.seedFrom! + i)
+    : [opts.heat.seed];
+  const total = seeds.length * (seeds.length > 1 ? 1 : opts.repeat);
+  console.log(`prompt chars≈${system.length + user.length} repeat=${opts.repeat} seeds=${seeds.length}`);
 
   if (opts.dryRun) {
     console.log("dry-run: no HTTP");
@@ -431,23 +486,29 @@ async function main() {
   }
 
   const results: ShotMeta[] = [];
-  for (let i = 1; i <= opts.repeat; i++) {
-    console.log(`\nshot ${i}/${opts.repeat}`);
-    const r = await shot(opts, env, system, user, i);
-    results.push(r);
-    if (!r.ok) console.log(`FAIL ${r.error}`);
-    else {
-      console.log(`ok sha256=${r.sha256} lines=${r.lines} tokens=${r.prompt_tokens}+${r.completion_tokens} ${r.elapsed_ms}ms`);
-      if (r.out_file) console.log(`  ${r.out_file}`);
+  let n = 0;
+  for (const seed of seeds) {
+    const heatOpts = { ...opts, heat: { ...opts.heat, seed } };
+    const times = seeds.length > 1 ? 1 : opts.repeat;
+    for (let i = 1; i <= times; i++) {
+      n += 1;
+      console.log(`\nshot ${n}/${total} seed=${seed}`);
+      const r = await shotWithRetry(heatOpts, env, system, user, i);
+      results.push(r);
+      if (!r.ok) console.log(`FAIL ${r.error}`);
+      else {
+        console.log(`ok sha256=${r.sha256} lines=${r.lines} tokens=${r.prompt_tokens}+${r.completion_tokens} ${r.elapsed_ms}ms`);
+        if (r.out_file) console.log(`  ${r.out_file}`);
+      }
     }
   }
 
   const hashes = results.filter((r) => r.ok && r.sha256).map((r) => r.sha256!);
-  if (opts.repeat > 1) {
-    const unique = new Set(hashes);
-    console.log(`\nidentical=${unique.size === 1 && hashes.length === opts.repeat} unique_hashes=${unique.size} ok=${hashes.length}/${opts.repeat}`);
-    for (const h of unique) console.log(`  ${h}`);
-  }
+  const unique = new Set(hashes);
+  console.log(`\nok=${hashes.length}/${results.length} unique_hashes=${unique.size}`);
+  const summary = join(opts.outDir, `summary-${Date.now()}.json`);
+  await Deno.writeTextFile(summary, JSON.stringify({ results }, null, 2) + "\n");
+  console.log(`summary ${summary}`);
 }
 
 if (import.meta.main) {
