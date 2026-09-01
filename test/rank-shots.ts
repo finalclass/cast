@@ -1,6 +1,6 @@
 #!/usr/bin/env -S deno run --allow-read --allow-write --allow-net --allow-env
 /**
- * Phase 2: score compiling pours against the spec on [0, 1].
+ * Phase 2: score compiling pours against the spec on an integer 1–1000 scale.
  * Same spec+mli body as the pour. No seed. Does not regenerate code.
  */
 
@@ -47,16 +47,16 @@ function messageText(
 function parseScore(text: string): { score: number | null; reason?: string } {
   const reasons = [...text.matchAll(/^\s*REASON\s*[:=]?\s*(.+)$/gim)];
   const reason = reasons.at(-1)?.[1]?.trim();
-  const scores = [...text.matchAll(/SCORE\s*[:=]?\s*([01](?:\.\d+)?|\.\d+)/gi)];
+  const scores = [...text.matchAll(/SCORE\s*[:=]?\s*(\d{1,4})\b/gi)];
   const last = scores.at(-1);
   if (last) {
     const n = Number(last[1]);
-    if (Number.isFinite(n) && n >= 0 && n <= 1) return { score: n, reason };
+    if (Number.isInteger(n) && n >= 1 && n <= 1000) return { score: n, reason };
   }
-  const json = [...text.matchAll(/"score"\s*:\s*([01](?:\.\d+)?)/g)].at(-1);
+  const json = [...text.matchAll(/"score"\s*:\s*(\d{1,4})\b/g)].at(-1);
   if (json) {
     const n = Number(json[1]);
-    if (Number.isFinite(n) && n >= 0 && n <= 1) return { score: n, reason };
+    if (Number.isInteger(n) && n >= 1 && n <= 1000) return { score: n, reason };
   }
   return { score: null };
 }
@@ -81,6 +81,7 @@ async function rankOne(
     temperature: number;
     provider?: string;
     maxTokens: number;
+    reasoningEffort?: string;
   },
   system: string,
   user: string,
@@ -95,12 +96,12 @@ async function rankOne(
     model: opts.model,
     temperature: opts.temperature,
     max_tokens: opts.maxTokens,
-    reasoning: { effort: "low" },
     messages: [
       { role: "system", content: system },
       { role: "user", content: user },
     ],
   };
+  if (opts.reasoningEffort) body.reasoning = { effort: opts.reasoningEffort };
   if (opts.provider) {
     body.provider = { order: [opts.provider], allow_fallbacks: false };
   }
@@ -192,6 +193,7 @@ async function rankWithRetry(
     temperature: number;
     provider?: string;
     maxTokens: number;
+    reasoningEffort?: string;
   },
   system: string,
   user: string,
@@ -212,11 +214,12 @@ async function main() {
   let dir = join(HERE, "runs");
   let specPath = join(HERE, "spec/confirm-hold-closed.md");
   let mliPath = join(HERE, "confirm-hold.mli");
-  let model = "openai/gpt-oss-120b";
-  let temperature = 0.7;
-  let provider = "cerebras";
+  let model = "google/gemini-2.5-flash";
+  let temperature = 0.3;
+  let provider: string | undefined;
   let concurrency = 20;
   let maxTokens = 2048;
+  let reasoningEffort: string | undefined;
   const positional: string[] = [];
   const args = Deno.args;
   for (let i = 0; i < args.length; i++) {
@@ -239,7 +242,11 @@ async function main() {
       i = ni;
     } else if (a === "--provider" || a.startsWith("--provider=")) {
       const [v, ni] = take(args, i, "--provider");
-      provider = v;
+      provider = v || undefined;
+      i = ni;
+    } else if (a === "--reasoning-effort" || a.startsWith("--reasoning-effort=")) {
+      const [v, ni] = take(args, i, "--reasoning-effort");
+      reasoningEffort = v;
       i = ni;
     } else if (a === "--concurrency" || a.startsWith("--concurrency=")) {
       const [v, ni] = take(args, i, "--concurrency");
@@ -283,7 +290,7 @@ async function main() {
     "Do not generate or rewrite code. Output exactly two lines.";
 
   console.log(
-    `rank model=${model} temperature=${temperature} seed=none provider=${provider} n=${mls.length} concurrency=${concurrency}`,
+    `rank model=${model} temperature=${temperature} seed=none provider=${provider ?? "any"} n=${mls.length} concurrency=${concurrency} scale=1-1000`,
   );
 
   const wall0 = Date.now();
@@ -293,12 +300,19 @@ async function main() {
       "\n\n## Candidate implementation\n\n```ocaml\n" +
       code.trim() +
       "\n```\n\n" +
-      "Score this candidate against the specification on a closed scale 0.0–1.0. " +
-      "1.0 means every spec rule is honoured. 0.0 means the code is unrelated. " +
+      "Score this candidate against the specification on an integer scale 1–1000. " +
+      "1 means unrelated. 1000 means every spec rule is honoured, including style " +
+      "(no comments, only confirm is exported, exact decision order). " +
+      "Use the full range; do not cluster at 1000. Typical compiling-but-imperfect code sits 600–900. " +
       "Reply with exactly two lines and nothing else:\n" +
-      "SCORE <float>\n" +
+      "SCORE <integer>\n" +
       "REASON <one sentence>\n";
-    const r = await rankWithRetry(env, { model, temperature, provider, maxTokens }, system, user);
+    const r = await rankWithRetry(
+      env,
+      { model, temperature, provider, maxTokens, reasoningEffort },
+      system,
+      user,
+    );
     const row: RankRow = { ml, ...r };
     console.log(
       `${row.ok ? "ok" : "FAIL"} ${basename(ml)} score=${row.score ?? "-"} ${row.elapsed_ms}ms` +
@@ -320,7 +334,9 @@ async function main() {
     concurrency,
     model,
     temperature,
+    provider: provider ?? null,
     seed: null,
+    scale: "1-1000",
     n: rows.length,
     scored: scored.length,
     mean_score: mean,
@@ -337,13 +353,22 @@ async function main() {
     failures: rows.filter((r) => r.score === null),
   };
   const out = join(dir, "ranking.json");
-  await Deno.writeTextFile(out, JSON.stringify(summary, null, 2) + "\n");
-  console.log(`\nscored ${scored.length}/${rows.length} wall_ms=${wall_ms} mean=${mean?.toFixed(3) ?? "-"}`);
+  const slug = model.replaceAll("/", "_");
+  const outModel = join(dir, `ranking-${slug}.json`);
+  const payload = JSON.stringify(summary, null, 2) + "\n";
+  await Deno.writeTextFile(out, payload);
+  await Deno.writeTextFile(outModel, payload);
+  const unique = new Set(scores).size;
+  console.log(
+    `\nscored ${scored.length}/${rows.length} wall_ms=${wall_ms} mean=${mean?.toFixed(1) ?? "-"} unique_scores=${unique}`,
+  );
   if (winner) {
-    console.log(`winner score=${winner.score} ${winner.ml}`);
+    const ties = scored.filter((r) => r.score === winner.score).length;
+    console.log(`winner score=${winner.score} ties=${ties} ${winner.ml}`);
     if (winner.reason) console.log(`reason ${winner.reason}`);
   }
   console.log(`ranking ${out}`);
+  console.log(`ranking ${outModel}`);
 }
 
 await main();
