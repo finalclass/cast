@@ -14,3 +14,5 @@ Min kept order, defaults+deltas table, and the 19 cases. It dropped per-field YA
 Min is not strictly better: one compiling miss used default `P1` on H-CLOSED (`Property_closed P1` instead of `P-SHUT`) — compact table is easier to misread. Some min bodies were *longer* (oss expanded the defaults).
 
 Cutting after green works as a pass@k game, not as “same seed, shorter, still identical.” Re-record Heat after a shrink.
+
+**Threshold, not “still works once.”** Keep a cut only while **X/Y** shots stay green (here Y=5, floor X=3). Sealed was 2/5 — below the floor, so the right move is to raise the fat spec first, not to cut it. Min landed at 3/5, so this cut sits *on* the floor: the next cut that drops to 2/5 is rejected. One green seed is how you get a massacre on the following 1% delta.
