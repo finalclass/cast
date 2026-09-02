@@ -75,7 +75,9 @@ The die is not a fourth argument. It lives in `prompt` for the pourer and in `ch
 
 Write spec / die / driver with ordinary file tools. Then loop `pour` until `checks` are green. That loop is sealing. After that, regeneration is `pour` without the frontier.
 
-**Shrink only against a pass@k floor.** A prompt that is green on *one* seed is not a form — the next delta becomes a long frontier session again. After sealing, you may cut the prompt, but each cut is kept only if **X of Y** shots still pass `checks` (same Y seeds, parallel `pour`). Stop at the last cut that stays at or above the floor.
+**Shrink is optional.** Sealing ends when `checks` are green. Do not block regeneration on a shorter prompt.
+
+If you do cut, only against a pass@k floor. A prompt that is green on *one* seed is not a form — the next delta becomes a long frontier session again. Each cut is kept only if **X of Y** shots still pass `checks` (same Y seeds, parallel `pour`). Stop at the last cut that stays at or above the floor.
 
 Y is the batch (we used 5). X is the floor (we used 3: keep the cut iff ≥3/5). Also do not go below the rate the *fat* spec already had. If the fat spec is 2/5, raise *that* first; do not shrink a weak form. Re-record Heat after any kept cut.
 
@@ -120,6 +122,7 @@ Die heat stays a stronger model. Shot heat stays cheap and, where the provider a
 - Let the pourer grade its own shots.
 - Treat an LLM score as the acceptance test.
 - Generate tests by reading a poured body so they fit that shot.
+- Require a shorter prompt before a seal counts.
 - Shrink a prompt because *one* shot was still green.
 
 ## Status
