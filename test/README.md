@@ -19,7 +19,7 @@ Heat = `(model, temperature, seed)`.
 
 Target body: ~500 lines of OCaml implementing the `.mli`. Closed spec: drop the padding, keep one decision order, attach examples the compiler can run.
 
-Conclusions from the probe live in the root README (who writes spec vs body, sieve, seed). Do not use the pourer as its own judge.
+Conclusions from the probe live in the root README (who writes spec vs body, sieve, seed). Do not use the pourer as its own judge. After a spec is green, shrinking it is a second pour loop (`test/SHRINK.md`).
 
 ## Run
 
